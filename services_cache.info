@@ -1,0 +1,11 @@
+name = Services Cache
+description = Provide a cache system for Services
+core = 6.x
+package = Services
+version = 1.x
+
+dependencies[] = services
+
+;Utilities
+;dependencies[] = ahah_helper
+;dependencies[] = autoload
