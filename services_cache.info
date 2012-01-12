@@ -6,5 +6,5 @@ package = Services
 dependencies[] = services
 
 ;Utilities
-dependencies[] = ahah_helper
+;dependencies[] = ahah_helper
 ;dependencies[] = autoload
