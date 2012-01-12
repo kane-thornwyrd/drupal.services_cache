@@ -1,0 +1,394 @@
+<?php
+
+/**
+ * Implementation of hook_menu();
+ */
+function services_cache_menu() {
+  $menu = array();
+
+  $menu['admin/build/services/cache'] = array(
+    'title' => 'Cache',
+    'description' => 'The Services Cache Settings',
+    'page arguments' => array('services_cache_form'),
+    'page callback' => 'drupal_get_form',
+    'access arguments' => array('configure Services\' Cache'),
+    'file' => 'services_cache.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $menu['admin/build/services/cache/flush'] = array(
+    'title' => 'Call Garbage collector',
+    'page arguments' => array('admin/build/services/cache'),
+    'page callback' => 'services_cache_cron',
+    'access arguments' => array('configure Services\' Cache'),
+    'type' => MENU_LOCAL_TASK,
+    'tab_parent' => 'admin/build/services'
+  );
+
+  return $menu;
+}
+
+/**
+ * Implementation of hook_perm();
+ */
+function services_cache_perm() {
+
+  $perms = array(
+    'configure Services\' Cache'
+  );
+
+  return $perms;
+}
+
+/**
+ * Implementation of hook_menu_alter();
+ */
+function services_cache_menu_alter(&$items) {
+  $endpoints = services_endpoint_load_all();
+  foreach ($endpoints as $endpoint) {
+    if (empty($endpoint->disabled)) {
+      $items[$endpoint->path]['page callback'] = 'services_cache_endpoint_callback';
+      $items[$endpoint->path]['page arguments'][] = '%map';
+    }
+  }
+}
+
+/**
+ * Implementation of hook_init();
+ * The idea behind this, is pretty simple: without this global, we don't have any mean to know if
+ * we have to capture the output buffer !
+ */
+function services_cache_init() {
+  global $serving_endpoint_resource;
+  $serving_endpoint_resource = FALSE;
+}
+
+/**
+ * Menu callback that intercept the call to the server handler through the endpoint callback.
+ * There's a trick here, as we want to serve a cache instead of the result of the legit callback, we
+ * have to start capturing the output buffer then… @see services_cache_exit().
+ * @param type $endpoint_name
+ */
+function services_cache_endpoint_callback($endpoint_name) {
+  global $serving_endpoint_resource, $user;
+  $endpoint = services_endpoint_load($endpoint_name);
+  $args = arg();
+  $request = array('GET' => $_GET, 'POST' => $_POST);
+  if ($endpoint) {
+    $file = _services_cache_file_exist($endpoint, $request, arg());
+    if ($file) {
+      services_cache_transfert($file);
+    }
+    else {
+      $serving_endpoint_resource = service_cache_getpath($endpoint, $request,
+        $args);
+      ob_start();
+      services_endpoint_callback($endpoint_name);
+    }
+  }
+}
+
+/**
+ * Implementation of hook_exit();
+ * … saving it in the cache file. @see services_cache_endpoint_callback().
+ */
+function services_cache_exit($destination = NULL) {
+  global $serving_endpoint_resource;
+
+  if (ob_get_level()) {
+    $cache = ob_get_contents();
+    ob_end_clean();
+  }
+
+  if ($serving_endpoint_resource) {
+    $file_wrote = @file_put_contents($serving_endpoint_resource, $cache, LOCK_EX);
+    if ($file_wrote === FALSE) {
+      watchdog('services_cache',
+        'Services Cache unable to create the file "%file".',
+        array('%file' => $serving_endpoint_resource), WATCHDOG_ALERT);
+    }
+  }
+
+  echo $cache;
+}
+
+/**
+ * Used to return a field's value, the default one if noone has been set in the $form_state.
+ * Incidentally, this function embeds the default settings for all this module's forms.
+ *
+ * @param string|array $key
+ * The key of the searched value.
+ * @param NULL|array $form_state
+ * The form state, if available, to extract submitted values.
+ *
+ * @return mixed|NULL
+ * return element found or NULL. Don't forget to === for checking the result !
+ */
+function services_cache_form_values($key, $form_state = array(), $default = NULL) {
+
+  $settings['services_cache'] = array();
+
+  $endpoints = services_endpoint_load_all();
+  foreach ($endpoints as $name => $endpoint) {
+    $settings['services_cache'][$name] = array();
+  }
+  if (isset($form_state['values']['services_cache'])) {
+    $settings = array_merge($settings, $form_state['values']);
+  }
+  if (isset($form_state['storage']['services_cache'])) {
+    $settings = array_merge($settings, $form_state['storage']);
+  }
+  $var = variable_get('services_cache', FALSE);
+  if (is_array($var)) {
+    $settings = array_merge($settings, array('services_cache' => $var));
+  }
+
+  $val = _extract_val($key, $settings);
+  $val = $val
+    ? $val
+    : $default;
+
+  return $val;
+}
+
+/**
+ * Recursively walk through the data array to search elements based on the string|array $search.
+ *
+ * @param string|array $search
+ * The sub-element of $data you search
+ * @param array $data
+ * The data to search in.
+ *
+ * @return mixed|NULL
+ * return element found or NULL. Don't forget to === for checking the result !
+ */
+function _extract_val($search, $data) {
+  if (is_array($search)) {
+    $key = key($search);
+    $path = array_shift($search);
+    if (isset($data[$key])) {
+      if (isset($path[0])) {
+        return _extract_val($path[0], $data[$key]);
+      }
+      else {
+        $subkey = key($path);
+        return _extract_val($path, $data[$key]);
+      }
+    }
+    else {
+      if (isset($data[$path[0]])) {
+        return $data[$path[0]];
+      }
+    }
+  }
+  else {
+    if (isset($data[$search])) {
+      return $data[$search];
+    }
+  }
+  return NULL;
+}
+
+/**
+ * Give you the "secret" cachefile name corresponding to the endpoint/request.
+ *
+ * @param type $endpoint_name
+ * @param array $request
+ * @return type
+ */
+function _services_cache_get_cachename($endpoint, array $request, array $args) {
+
+  $original_filename = array_pop($args);
+  $original_ext = substr($original_filename, strrpos($original_filename, '.'));
+  $secret = services_cache_form_values(array(
+    'services_cache' => array(
+      $endpoint->name => array(
+        'secret',
+      ),
+    ),
+    ));
+
+  return sha1($secret . serialize($request)) . $original_ext;
+}
+
+function _services_cache_file_exist($endpoint, array $request, array $args) {
+  $file = service_cache_getpath($endpoint, $request, $args);
+
+  if (is_file($file)) {
+    return $file;
+  }
+  elseif (is_file($file = file_create_path($file))) {
+    return $file;
+  }
+  return FALSE;
+}
+
+function service_cache_getpath($endpoint, array $request, array $args) {
+  return file_directory_path() . '/' . services_cache_form_values(array(
+      'services_cache' => array(
+        $endpoint->name => array(
+          'cache_folder',
+        ),
+      ),
+    )) . '/' . $args[1] . '/' . _services_cache_get_cachename($endpoint,
+      $request, $args);
+}
+
+function services_cache_transfert($path) {
+  $mime = mime_content_type($path);
+  if ($mime === 'text/plain') {
+    $ext_to_mime = array(
+      '.json' => 'application/json',
+    );
+    $mime = $ext_to_mime[substr($path, strripos($path, '.'))];
+  }
+  $headers = array('Content-Type: ' . mime_header_encode($mime));
+
+  $fileinfo = stat($path);
+  if ($fileinfo) {
+    $headers[] = 'Content-Length: ' . $fileinfo[7];
+    $headers[] = 'Expires: ' . gmdate('D, d M Y H:i:s', time() + 1209600) . ' GMT';
+    $headers[] = 'Cache-Control: max-age=1209600, private, must-revalidate';
+    _services_cache_set_cache_headers($fileinfo, $headers);
+  }
+  file_transfer($path, $headers);
+}
+
+/**
+ * Ripoff from imagecache.
+ * Set file headers that handle "If-Modified-Since" correctly for the
+ * given fileinfo.
+ *
+ * Note that this function may return or may call exit().
+ *
+ * Most code has been taken from drupal_page_cache_header().
+ *
+ * @param $fileinfo
+ *   Array returned by stat().
+ * @param
+ *   Array of existing headers.
+ * @return
+ *   Nothing but beware that this function may not return.
+ */
+function _services_cache_set_cache_headers($fileinfo, &$headers) {
+  // Set default values:
+  $last_modified = gmdate('D, d M Y H:i:s', $fileinfo[9]) . ' GMT';
+  $etag = '"' . md5($last_modified) . '"';
+
+  // See if the client has provided the required HTTP headers:
+  $if_modified_since = isset($_SERVER['HTTP_IF_MODIFIED_SINCE'])
+    ? stripslashes($_SERVER['HTTP_IF_MODIFIED_SINCE'])
+    : FALSE;
+  $if_none_match = isset($_SERVER['HTTP_IF_NONE_MATCH'])
+    ? stripslashes($_SERVER['HTTP_IF_NONE_MATCH'])
+    : FALSE;
+
+  if ($if_modified_since && $if_none_match
+    && $if_none_match == $etag // etag must match
+    && $if_modified_since == $last_modified) { // if-modified-since must match
+    header('HTTP/1.1 304 Not Modified');
+    // All 304 responses must send an etag if the 200 response
+    // for the same object contained an etag
+    header('Etag: ' . $etag);
+    // We must also set Last-Modified again, so that we overwrite Drupal's
+    // default Last-Modified header with the right one
+    header('Last-Modified: ' . $last_modified);
+    exit;
+  }
+
+  // Send appropriate response:
+  $headers[] = 'Last-Modified: ' . $last_modified;
+  $headers[] = 'ETag: ' . $etag;
+}
+
+/**
+ * Implementation of hook_cron();
+ */
+function services_cache_cron($destination = NULL) {
+  $suppressed_file_nb = 0;
+  $suppressed_file_errors = array();
+  define('MTIME', 9);
+  $endpoints = services_endpoint_load_all();
+  foreach ($endpoints as $name => $endpoint) {
+    $timeout = services_cache_form_values(array(
+        'services_cache' => array(
+          $name => array(
+            'timeout' => array(
+              'amount'
+            ),
+          ),
+        ),
+      )) * services_cache_form_values(array(
+        'services_cache' => array(
+          $name => array(
+            'timeout' => array(
+              'unit'
+            ),
+          ),
+        ),
+      ));
+    $cache_folder = services_cache_form_values(array(
+      'services_cache' => array(
+        $name => array(
+          'cache_folder',
+        ),
+      ),
+      ));
+    foreach ($endpoint->resources as $resource_name => $resource) {
+      $folder = file_directory_path() . '/' . $cache_folder . '/' . $resource_name;
+      if (is_dir($folder)) {
+        $dh = opendir($folder);
+        $folder .= '/';
+        if ($dh) {
+          while (($file = readdir($dh)) !== false) {
+            if (filetype($folder . $file) !== 'dir') {
+              $stat = stat($folder . $file);
+              if ($stat[MTIME] + $timeout < time()) {
+                if (unlink($folder . $file)) {
+                  $suppressed_file_nb++;
+                }
+                else {
+                  $suppressed_file_errors[] = $folder . $file;
+                }
+              }
+            }
+          }
+          closedir($dh);
+        }
+      }
+    }
+  }
+
+  if (count($suppressed_file_errors)) {
+    $files = '<ul><li>' . implode('</li><li>', $suppressed_file_errors) . '</li></ul>';
+    watchdog('services_cache', 'Unable to suppress files : @files',
+      array('@files' => $files), WATCHDOG_CRITICAL);
+    drupal_set_message('An Error occured, call the site administrator', 'error');
+  }
+
+  if ($destination) {
+    drupal_set_message(t('Service Cache Garbage collector passed ! !nb Files suppressed.', array('!nb' => $suppressed_file_nb)));
+    drupal_goto($destination);
+  }
+}
+
+function services_cache_flush_directory($endpoint_name, $resource_name) {
+  $cache_folder = services_cache_form_values(array(
+    'services_cache' => array(
+      $endpoint_name => array(
+        'cache_folder',
+      ),
+    ),
+    ));
+  $folder = file_directory_path() . '/' . $cache_folder . '/' . $resource_name;
+  $dh = opendir($folder);
+  $folder .= '/';
+  if ($dh) {
+    while (($file = readdir($dh)) !== false) {
+      if (filetype($folder . $file) !== 'dir') {
+        unlink($folder . $file);
+      }
+    }
+    closedir($dh);
+  }
+}
